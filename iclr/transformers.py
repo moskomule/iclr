@@ -70,7 +70,7 @@ class SelfAttention(nn.Module):
                  enable_bias: bool,
                  enable_causal_mask: bool,
                  enable_proj: bool,
-                 block_size: int,
+                 num_tokens: int,
                  ):
         super().__init__()
         assert num_embed % num_heads == 0
@@ -89,7 +89,7 @@ class SelfAttention(nn.Module):
         self.enable_causal_mask = enable_causal_mask
         self.bias = None
         if self.enable_causal_mask:
-            self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))[None, None])
+            self.register_buffer("bias", torch.tril(torch.ones(num_tokens, num_tokens))[None, None])
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -144,7 +144,7 @@ class Block(nn.Module):
                  attn_activation: Callable[[torch.Tensor], torch.Tensor],
                  mlp_activation: Callable[[torch.Tensor], torch.Tensor],
                  attn_scale: Callable[[torch.Tensor], float],
-                 block_size: int,
+                 num_tokens: int,
                  enable_ln: bool,
                  enable_bias: bool,
                  enable_proj: bool,
@@ -155,7 +155,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(num_embed, bias=enable_bias) if enable_ln else nn.Identity()
         self.ln_2 = LayerNorm(num_embed, bias=enable_bias) if enable_ln else nn.Identity()
         self.attn = SelfAttention(num_embed, num_heads, attn_activation, attn_scale, enable_flash_attention,
-                                  enable_bias, enable_causal_mask, enable_proj, block_size)
+                                  enable_bias, enable_causal_mask, enable_proj, num_tokens)
         self.mlp = MLP(num_embed, mlp_activation, enable_bias)
 
     def forward(self, x):
@@ -164,16 +164,16 @@ class Block(nn.Module):
         return x
 
 
-class GPT(nn.Module):
+class Transformer(nn.Module):
 
     def __init__(self,
                  num_layers: int,
                  num_embed: int,
                  num_heads: int,
-                 attn_activation: Callable[[torch.Tensor], torch.Tensor],
-                 mlp_activation: Callable[[torch.Tensor], torch.Tensor],
-                 attn_scale: Callable[[torch.Tensor], float],
-                 block_size: int,
+                 attn_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
+                 mlp_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
+                 attn_scale: Callable[[torch.Tensor], float] = attn_scale_len,
+                 num_tokens: int = None,
                  enable_ln: bool = False,
                  enable_bias: bool = False,
                  enable_proj: bool = False,
@@ -182,10 +182,13 @@ class GPT(nn.Module):
                  ):
         super().__init__()
 
+        assert (not enable_causal_mask) or (num_tokens is not None), "Cannot enable causal mask when num_tokens is None"
+
         self.blocks = nn.ModuleList([Block(num_embed, num_heads, attn_activation, mlp_activation, attn_scale,
-                                           block_size, enable_ln, enable_bias, enable_proj, enable_causal_mask,
+                                           num_tokens, enable_ln, enable_bias, enable_proj, enable_causal_mask,
                                            enable_flash_attention) for _ in range(num_layers)])
         self.ln = LayerNorm(num_embed, enable_bias) if enable_ln else nn.Identity()
+        self.readout = nn.Linear(num_embed, 1, bias=False)
 
         # init all weights
         self._init_weights()
@@ -210,11 +213,13 @@ class GPT(nn.Module):
         self.apply(f)
 
     def forward(self,
-                emb: torch.Tensor):
+                emb: torch.Tensor
+                ) -> torch.Tensor:
         h = emb
         for block in self.blocks:
             h = block(h)
-        return self.ln(h)
+        h = self.ln(h)
+        return self.readout(h)
 
     def configure_optimizers(self,
                              weight_decay: float,
