@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 from rich import print
 from torch.nn import functional as F
-from torch.optim import lr_scheduler
 
 
 def attn_scale_len(k: torch.Tensor) -> float:
@@ -62,7 +61,7 @@ def self_attention(
 class SelfAttention(nn.Module):
 
     def __init__(self,
-                 num_embed: int,
+                 dim_embed: int,
                  num_heads: int,
                  activation: Callable[[torch.Tensor], torch.Tensor],
                  attn_scale: Callable[[torch.Tensor], float],
@@ -73,14 +72,14 @@ class SelfAttention(nn.Module):
                  num_tokens: int,
                  ):
         super().__init__()
-        assert num_embed % num_heads == 0
+        assert dim_embed % num_heads == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(num_embed, 3 * num_embed, bias=enable_bias)
+        self.c_attn = nn.Linear(dim_embed, 3 * dim_embed, bias=enable_bias)
         # output projection
-        self.c_proj = nn.Linear(num_embed, num_embed, bias=enable_bias) if enable_proj else nn.Identity()
+        self.c_proj = nn.Linear(dim_embed, dim_embed, bias=enable_bias) if enable_proj else nn.Identity()
 
         self.num_heads = num_heads
-        self.num_embed = num_embed
+        self.num_embed = dim_embed
         self.self_attention = self_attention
         self.activation = activation
         self.attn_scale = attn_scale
@@ -120,13 +119,13 @@ class SelfAttention(nn.Module):
 class MLP(nn.Module):
 
     def __init__(self,
-                 num_embed: int,
+                 dim_embed: int,
                  activation: Callable[[torch.Tensor], torch.Tensor],
                  enable_bias: bool,
                  ):
         super().__init__()
-        self.c_fc = nn.Linear(num_embed, 4 * num_embed, bias=enable_bias)
-        self.c_proj = nn.Linear(4 * num_embed, num_embed, bias=enable_bias)
+        self.c_fc = nn.Linear(dim_embed, 4 * dim_embed, bias=enable_bias)
+        self.c_proj = nn.Linear(4 * dim_embed, dim_embed, bias=enable_bias)
         self.activation = activation
 
     def forward(self, x):
@@ -139,7 +138,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
 
     def __init__(self,
-                 num_embed: int,
+                 dim_embed: int,
                  num_heads: int,
                  attn_activation: Callable[[torch.Tensor], torch.Tensor],
                  mlp_activation: Callable[[torch.Tensor], torch.Tensor],
@@ -152,11 +151,11 @@ class Block(nn.Module):
                  enable_flash_attention: bool):
         super().__init__()
 
-        self.ln_1 = LayerNorm(num_embed, bias=enable_bias) if enable_ln else nn.Identity()
-        self.ln_2 = LayerNorm(num_embed, bias=enable_bias) if enable_ln else nn.Identity()
-        self.attn = SelfAttention(num_embed, num_heads, attn_activation, attn_scale, enable_flash_attention,
+        self.ln_1 = LayerNorm(dim_embed, bias=enable_bias) if enable_ln else nn.Identity()
+        self.ln_2 = LayerNorm(dim_embed, bias=enable_bias) if enable_ln else nn.Identity()
+        self.attn = SelfAttention(dim_embed, num_heads, attn_activation, attn_scale, enable_flash_attention,
                                   enable_bias, enable_causal_mask, enable_proj, num_tokens)
-        self.mlp = MLP(num_embed, mlp_activation, enable_bias)
+        self.mlp = MLP(dim_embed, mlp_activation, enable_bias)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -164,11 +163,13 @@ class Block(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
+class STTransformer(nn.Module):
+    """ Transformer model in TFs as Statisticians
+    """
 
     def __init__(self,
                  num_layers: int,
-                 num_embed: int,
+                 dim_embed: int,
                  num_heads: int,
                  attn_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
                  mlp_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
@@ -184,11 +185,12 @@ class Transformer(nn.Module):
 
         assert (not enable_causal_mask) or (num_tokens is not None), "Cannot enable causal mask when num_tokens is None"
 
-        self.blocks = nn.ModuleList([Block(num_embed, num_heads, attn_activation, mlp_activation, attn_scale,
+        self.dim_embed = dim_embed
+        self.blocks = nn.ModuleList([Block(dim_embed, num_heads, attn_activation, mlp_activation, attn_scale,
                                            num_tokens, enable_ln, enable_bias, enable_proj, enable_causal_mask,
                                            enable_flash_attention) for _ in range(num_layers)])
-        self.ln = LayerNorm(num_embed, enable_bias) if enable_ln else nn.Identity()
-        self.readout = nn.Linear(num_embed, 1, bias=False)
+        self.ln = LayerNorm(dim_embed, enable_bias) if enable_ln else nn.Identity()
+        self.readout = nn.Linear(dim_embed, 1, bias=False)
 
         # init all weights
         self._init_weights()
@@ -213,9 +215,14 @@ class Transformer(nn.Module):
         self.apply(f)
 
     def forward(self,
-                emb: torch.Tensor
+                xs: torch.Tensor,
+                ys: torch.Tensor
                 ) -> torch.Tensor:
-        h = emb
+        # xs: input (b, t, c)
+        # ys: target (b, t)
+        ys = ys.clone()
+        ys[:, -1] = 0  # because test data!
+        h = torch.cat([xs, ys[:, :, None]], dim=-1)
         for block in self.blocks:
             h = block(h)
         h = self.ln(h)
@@ -224,9 +231,7 @@ class Transformer(nn.Module):
     def configure_optimizers(self,
                              weight_decay: float,
                              learning_rate: float,
-                             betas: tuple[float, float],
-                             warmup_iters: int,
-                             total_iters: int,
+                             betas: tuple[float, float] = None,
                              ):
         # start with all the candidate parameters
         param_dict = [p for pn, p in self.named_parameters() if p.requires_grad]
@@ -244,10 +249,4 @@ class Transformer(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=torch.cuda.is_available())
-        scheduler = lr_scheduler.SequentialLR(optimizer,
-                                              [lr_scheduler.LinearLR(optimizer, total_iters=warmup_iters),
-                                               lr_scheduler.CosineAnnealingLR(optimizer,
-                                                                              T_max=total_iters - warmup_iters,
-                                                                              eta_min=learning_rate * 0.1)],
-                                              milestones=[warmup_iters])
-        return optimizer, scheduler
+        return optimizer

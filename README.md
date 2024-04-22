@@ -18,3 +18,15 @@ or
 ```
 pip install -U -e .
 ```
+
+## Train models
+
+```
+hatch run python train.py ...
+```
+
+or
+
+```
+python train.py ...
+```
