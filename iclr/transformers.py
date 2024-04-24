@@ -171,6 +171,7 @@ class STTransformer(nn.Module):
                  num_layers: int,
                  dim_embed: int,
                  num_heads: int,
+                 dim_data: int,
                  attn_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
                  mlp_activation: Callable[[torch.Tensor], torch.Tensor] = F.relu,
                  attn_scale: Callable[[torch.Tensor], float] = attn_scale_len,
@@ -186,6 +187,7 @@ class STTransformer(nn.Module):
         assert (not enable_causal_mask) or (num_tokens is not None), "Cannot enable causal mask when num_tokens is None"
 
         self.dim_embed = dim_embed
+        self.proj = nn.Parameter(torch.eye(dim_data, dim_embed))
         self.blocks = nn.ModuleList([Block(dim_embed, num_heads, attn_activation, mlp_activation, attn_scale,
                                            num_tokens, enable_ln, enable_bias, enable_proj, enable_causal_mask,
                                            enable_flash_attention) for _ in range(num_layers)])
@@ -223,6 +225,7 @@ class STTransformer(nn.Module):
         ys = ys.clone()
         ys[:, -1] = 0  # because test data!
         h = torch.cat([xs, ys[:, :, None]], dim=-1)
+        h = torch.einsum("de,btd->bte", self.proj, h)
         for block in self.blocks:
             h = block(h)
         h = self.ln(h)
@@ -248,5 +251,8 @@ class STTransformer(nn.Module):
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=torch.cuda.is_available())
+        kwargs = dict(lr=learning_rate, fused=torch.cuda.is_available())
+        if betas is not None:
+            kwargs['betas'] = betas
+        optimizer = torch.optim.AdamW(optim_groups, **kwargs)
         return optimizer

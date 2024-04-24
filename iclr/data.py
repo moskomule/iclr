@@ -29,8 +29,8 @@ class Task(object):
 class LinearRegression(Task):
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.data_source(self.batch_size, self.dataset_size, self.dim_data, device=self.device)
-        w = F.normalize(x.new_empty(self.batch_size, self.dataset_size, 1).normal_())
-        return x, (x @ w)[:, :, 0]
+        w = F.normalize(x.new_empty(self.batch_size, self.dim_data).normal_())
+        return x, torch.einsum("bsd,bd->bs", x, w)
 
     def loss_f(self, x: torch.Tensor, y: torch.Tensor, *, reduction: str = "mean") -> torch.Tensor:
         return F.mse_loss(x, y, reduction=reduction)
